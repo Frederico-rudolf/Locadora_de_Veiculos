@@ -1,0 +1,105 @@
+asyncapi: 3.0.0
+info:
+  title: LocaFácil – eventos
+  version: 1.0.0
+  description: |
+    Todas as mensagens passam por um único tópico SNS (locacao-eventos) e chegam
+    às filas SQS de cada serviço por assinatura com filtro no atributo "type".
+    O corpo de toda mensagem é o envelope em envelope.schema.json; o payload de cada
+    tipo/versão está em events/<Tipo>.v<versão>.schema.json.
+
+defaultContentType: application/json
+
+channels:
+  locacao-eventos:
+    address: locacao-eventos
+    description: Tópico SNS único. Atributo de mensagem "type" = tipo do evento.
+    messages:
+      ReservaSolicitada: { $ref: '#/components/messages/ReservaSolicitada' }
+      VeiculoBloqueado: { $ref: '#/components/messages/VeiculoBloqueado' }
+      VeiculoIndisponivel: { $ref: '#/components/messages/VeiculoIndisponivel' }
+      PagamentoSolicitado: { $ref: '#/components/messages/PagamentoSolicitado' }
+      PagamentoAprovado: { $ref: '#/components/messages/PagamentoAprovado' }
+      PagamentoRecusado: { $ref: '#/components/messages/PagamentoRecusado' }
+      ReservaConfirmadaV1: { $ref: '#/components/messages/ReservaConfirmadaV1' }
+      ReservaConfirmadaV2: { $ref: '#/components/messages/ReservaConfirmadaV2' }
+      ReservaCancelada: { $ref: '#/components/messages/ReservaCancelada' }
+      EstornoSolicitado: { $ref: '#/components/messages/EstornoSolicitado' }
+      PagamentoEstornado: { $ref: '#/components/messages/PagamentoEstornado' }
+  reservas-queue:
+    address: reservas-queue
+    description: VeiculoBloqueado, VeiculoIndisponivel, PagamentoAprovado, PagamentoRecusado
+  frota-queue:
+    address: frota-queue
+    description: ReservaSolicitada, ReservaConfirmada, ReservaCancelada
+  pagamentos-queue:
+    address: pagamentos-queue
+    description: PagamentoSolicitado, EstornoSolicitado
+  notificacoes-queue:
+    address: notificacoes-queue
+    description: ReservaConfirmada, ReservaCancelada, PagamentoEstornado
+
+operations:
+  reservasPublica:
+    action: send
+    channel: { $ref: '#/channels/locacao-eventos' }
+    summary: Serviço Reservas (TypeScript)
+    messages:
+      - $ref: '#/channels/locacao-eventos/messages/ReservaSolicitada'
+      - $ref: '#/channels/locacao-eventos/messages/PagamentoSolicitado'
+      - $ref: '#/channels/locacao-eventos/messages/ReservaConfirmadaV1'
+      - $ref: '#/channels/locacao-eventos/messages/ReservaConfirmadaV2'
+      - $ref: '#/channels/locacao-eventos/messages/ReservaCancelada'
+      - $ref: '#/channels/locacao-eventos/messages/EstornoSolicitado'
+  frotaPublica:
+    action: send
+    channel: { $ref: '#/channels/locacao-eventos' }
+    summary: Serviço Frota (Java)
+    messages:
+      - $ref: '#/channels/locacao-eventos/messages/VeiculoBloqueado'
+      - $ref: '#/channels/locacao-eventos/messages/VeiculoIndisponivel'
+  pagamentosPublica:
+    action: send
+    channel: { $ref: '#/channels/locacao-eventos' }
+    summary: Serviço Pagamentos (Python)
+    messages:
+      - $ref: '#/channels/locacao-eventos/messages/PagamentoAprovado'
+      - $ref: '#/channels/locacao-eventos/messages/PagamentoRecusado'
+      - $ref: '#/channels/locacao-eventos/messages/PagamentoEstornado'
+  reservasConsome:
+    action: receive
+    channel: { $ref: '#/channels/reservas-queue' }
+  frotaConsome:
+    action: receive
+    channel: { $ref: '#/channels/frota-queue' }
+  pagamentosConsome:
+    action: receive
+    channel: { $ref: '#/channels/pagamentos-queue' }
+  notificacoesConsome:
+    action: receive
+    channel: { $ref: '#/channels/notificacoes-queue' }
+
+components:
+  messages:
+    ReservaSolicitada:
+      payload: { $ref: './events/ReservaSolicitada.v1.schema.json' }
+    VeiculoBloqueado:
+      payload: { $ref: './events/VeiculoBloqueado.v1.schema.json' }
+    VeiculoIndisponivel:
+      payload: { $ref: './events/VeiculoIndisponivel.v1.schema.json' }
+    PagamentoSolicitado:
+      payload: { $ref: './events/PagamentoSolicitado.v1.schema.json' }
+    PagamentoAprovado:
+      payload: { $ref: './events/PagamentoAprovado.v1.schema.json' }
+    PagamentoRecusado:
+      payload: { $ref: './events/PagamentoRecusado.v1.schema.json' }
+    ReservaConfirmadaV1:
+      payload: { $ref: './events/ReservaConfirmada.v1.schema.json' }
+    ReservaConfirmadaV2:
+      payload: { $ref: './events/ReservaConfirmada.v2.schema.json' }
+    ReservaCancelada:
+      payload: { $ref: './events/ReservaCancelada.v1.schema.json' }
+    EstornoSolicitado:
+      payload: { $ref: './events/EstornoSolicitado.v1.schema.json' }
+    PagamentoEstornado:
+      payload: { $ref: './events/PagamentoEstornado.v1.schema.json' }

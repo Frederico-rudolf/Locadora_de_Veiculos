@@ -1,0 +1,26 @@
+server:
+  port: 8080
+spring:
+  application:
+    name: frota
+  datasource:
+    url: ${DB_URL}
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
+    hikari:
+      maximum-pool-size: 20
+      initialization-fail-timeout: -1   # sobe mesmo que o banco ainda não esteja pronto
+  sql:
+    init:
+      mode: always
+      continue-on-error: false
+locafacil:
+  topic-name: ${TOPIC_NAME:locacao-eventos}
+  queue-name: ${QUEUE_NAME:frota-queue}
+  consumer-threads: ${CONSUMER_THREADS:4}
+  aws:
+    region: ${AWS_REGION:us-east-1}
+    endpoint: ${AWS_ENDPOINT_URL:}
+logging:
+  pattern:
+    console: '%d{HH:mm:ss.SSS} %-5level [frota] [%thread] %msg%n'

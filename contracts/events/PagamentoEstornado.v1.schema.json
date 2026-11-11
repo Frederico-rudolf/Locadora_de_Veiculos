@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://locafacil.example/contracts/events/PagamentoEstornado.v1.schema.json",
+  "title": "PagamentoEstornado v1",
+  "description": "Pagamentos -> Notificações.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "reservaId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "pagamentoId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "valor": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    }
+  },
+  "required": [
+    "reservaId",
+    "pagamentoId",
+    "valor"
+  ]
+}

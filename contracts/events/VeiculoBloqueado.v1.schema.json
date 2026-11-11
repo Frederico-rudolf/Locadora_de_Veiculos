@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://locafacil.example/contracts/events/VeiculoBloqueado.v1.schema.json",
+  "title": "VeiculoBloqueado v1",
+  "description": "Frota -> Reservas. Unidade bloqueada para o período.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "reservaId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "filial": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 10
+    },
+    "categoria": {
+      "type": "string",
+      "enum": [
+        "HATCH",
+        "SEDAN",
+        "SUV"
+      ]
+    },
+    "dataInicio": {
+      "type": "string",
+      "format": "date"
+    },
+    "dataFim": {
+      "type": "string",
+      "format": "date"
+    }
+  },
+  "required": [
+    "reservaId"
+  ]
+}

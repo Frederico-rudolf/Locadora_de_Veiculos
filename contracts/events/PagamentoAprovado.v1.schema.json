@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://locafacil.example/contracts/events/PagamentoAprovado.v1.schema.json",
+  "title": "PagamentoAprovado v1",
+  "description": "Pagamentos -> Reservas.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "reservaId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "pagamentoId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "transacaoId": {
+      "type": "string"
+    },
+    "valor": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    }
+  },
+  "required": [
+    "reservaId",
+    "pagamentoId",
+    "transacaoId",
+    "valor"
+  ]
+}

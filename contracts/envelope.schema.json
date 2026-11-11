@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://locafacil.example/contracts/envelope.schema.json",
+  "title": "Envelope",
+  "description": "Envelope comum a TODAS as mensagens do LocaFácil. O tipo e a versão escolhem o schema do payload em events/<type>.v<version>.schema.json.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "messageId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Único por mensagem; chave de idempotência dos consumidores."
+    },
+    "correlationId": {
+      "type": "string",
+      "description": "Id da reserva; liga todas as mensagens da mesma saga."
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "EstornoSolicitado",
+        "PagamentoAprovado",
+        "PagamentoEstornado",
+        "PagamentoRecusado",
+        "PagamentoSolicitado",
+        "ReservaCancelada",
+        "ReservaConfirmada",
+        "ReservaSolicitada",
+        "VeiculoBloqueado",
+        "VeiculoIndisponivel"
+      ]
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "occurredAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "payload": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "messageId",
+    "correlationId",
+    "type",
+    "version",
+    "occurredAt",
+    "payload"
+  ]
+}

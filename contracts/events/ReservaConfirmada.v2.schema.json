@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://locafacil.example/contracts/events/ReservaConfirmada.v2.schema.json",
+  "title": "ReservaConfirmada v2",
+  "description": "Reservas -> Frota, Notificações. Versão 2: valor vira objeto {total, moeda} e inclui transacaoId. Consumidores da v1 continuam funcionando (Frota só lê reservaId; Notificações converte v1 -> v2).",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "reservaId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "clienteId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "clienteEmail": {
+      "type": "string",
+      "format": "email"
+    },
+    "filial": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 10
+    },
+    "categoria": {
+      "type": "string",
+      "enum": [
+        "HATCH",
+        "SEDAN",
+        "SUV"
+      ]
+    },
+    "dataInicio": {
+      "type": "string",
+      "format": "date"
+    },
+    "dataFim": {
+      "type": "string",
+      "format": "date"
+    },
+    "valor": {
+      "type": "object",
+      "properties": {
+        "total": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "moeda": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$"
+        }
+      },
+      "required": [
+        "total",
+        "moeda"
+      ]
+    },
+    "transacaoId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "reservaId",
+    "clienteId",
+    "filial",
+    "categoria",
+    "dataInicio",
+    "dataFim",
+    "valor",
+    "transacaoId"
+  ]
+}

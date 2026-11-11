@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="720" viewBox="0 0 1160 720" font-family="Helvetica, Arial, sans-serif">
+<defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#334155"/></marker></defs>
+<rect width="1160" height="720" fill="#ffffff"/>
+<text x="40" y="44" font-size="22" font-weight="700" fill="#0f172a">LocaFácil – arquitetura</text>
+<text x="40" y="70" font-size="13" fill="#475569">4 microsserviços · 3 linguagens · banco por serviço</text>
+<rect x="355" y="14" width="180" height="46" rx="23" fill="#f1f5f9" stroke="#334155"/><text x="445" y="42" text-anchor="middle" font-size="15" fill="#0f172a">Cliente HTTP</text>
+<line x1="445" y1="60" x2="445" y2="108" stroke="#334155" stroke-width="1.6" marker-end="url(#ar)"/>
+<text x="455" y="86" font-size="12" fill="#334155">POST /reservas → 202 + id · GET /reservas/{id}</text>
+<rect x="40" y="110" width="200" height="520" rx="10" fill="#fef9c3" stroke="#a16207" stroke-width="1.5"/>
+<text x="140" y="140" text-anchor="middle" font-size="12" fill="#a16207" font-weight="700">MINISTACK · MENSAGERIA</text>
+<text x="140" y="330" text-anchor="middle" font-size="16" font-weight="700" fill="#422006">SNS</text>
+<text x="140" y="350" text-anchor="middle" font-size="16" font-weight="700" fill="#422006">locacao-eventos</text>
+<text x="140" y="370" text-anchor="middle" font-size="13" font-weight="400" fill="#422006"></text>
+<text x="140" y="390" text-anchor="middle" font-size="13" font-weight="400" fill="#422006">↓ assinatura com filtro</text>
+<text x="140" y="410" text-anchor="middle" font-size="13" font-weight="400" fill="#422006">por tipo de evento</text>
+<text x="140" y="430" text-anchor="middle" font-size="13" font-weight="400" fill="#422006"></text>
+<text x="140" y="450" text-anchor="middle" font-size="13" font-weight="400" fill="#422006">SQS: 1 fila por serviço</text>
+<text x="140" y="470" text-anchor="middle" font-size="13" font-weight="400" fill="#422006">+ DLQ (3 tentativas)</text>
+<rect x="330" y="110" width="230" height="100" rx="10" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+<text x="445" y="146" text-anchor="middle" font-size="17" font-weight="700" fill="#0f172a">Reservas</text>
+<text x="445" y="168" text-anchor="middle" font-size="13" fill="#2563eb" font-weight="700">TypeScript</text>
+<text x="445" y="189" text-anchor="middle" font-size="12" fill="#334155">API 202 + orquestrador da saga</text>
+<path d="M600,122 a60,9 0 0,0 120,0 v38 a60,9 0 0,1 -120,0 z" fill="#f8fafc" stroke="#475569"/><ellipse cx="660" cy="122" rx="60" ry="9" fill="#e2e8f0" stroke="#475569"/>
+<text x="660" y="150" text-anchor="middle" font-size="12" fill="#0f172a">reservas-db</text><text x="660" y="165" text-anchor="middle" font-size="10" fill="#64748b">Postgres</text>
+<line x1="560" y1="140" x2="600" y2="140" stroke="#475569" stroke-width="1.6"/>
+<line x1="242" y1="160" x2="328" y2="160" stroke="#a16207" stroke-width="1.8" stroke-dasharray="6 4" marker-start="url(#ar)" marker-end="url(#ar)"/>
+<rect x="330" y="250" width="230" height="100" rx="10" fill="#ffedd5" stroke="#ea580c" stroke-width="2"/>
+<text x="445" y="286" text-anchor="middle" font-size="17" font-weight="700" fill="#0f172a">Frota</text>
+<text x="445" y="308" text-anchor="middle" font-size="13" fill="#ea580c" font-weight="700">Java / Spring Boot</text>
+<text x="445" y="329" text-anchor="middle" font-size="12" fill="#334155">disponibilidade e bloqueio</text>
+<path d="M600,262 a60,9 0 0,0 120,0 v38 a60,9 0 0,1 -120,0 z" fill="#f8fafc" stroke="#475569"/><ellipse cx="660" cy="262" rx="60" ry="9" fill="#e2e8f0" stroke="#475569"/>
+<text x="660" y="290" text-anchor="middle" font-size="12" fill="#0f172a">frota-db</text><text x="660" y="305" text-anchor="middle" font-size="10" fill="#64748b">Postgres</text>
+<line x1="560" y1="280" x2="600" y2="280" stroke="#475569" stroke-width="1.6"/>
+<line x1="242" y1="300" x2="328" y2="300" stroke="#a16207" stroke-width="1.8" stroke-dasharray="6 4" marker-start="url(#ar)" marker-end="url(#ar)"/>
+<rect x="330" y="390" width="230" height="100" rx="10" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+<text x="445" y="426" text-anchor="middle" font-size="17" font-weight="700" fill="#0f172a">Pagamentos</text>
+<text x="445" y="448" text-anchor="middle" font-size="13" fill="#16a34a" font-weight="700">Python · 2+ réplicas</text>
+<text x="445" y="469" text-anchor="middle" font-size="12" fill="#334155">cobrança com retentativas</text>
+<path d="M600,402 a60,9 0 0,0 120,0 v38 a60,9 0 0,1 -120,0 z" fill="#f8fafc" stroke="#475569"/><ellipse cx="660" cy="402" rx="60" ry="9" fill="#e2e8f0" stroke="#475569"/>
+<text x="660" y="430" text-anchor="middle" font-size="12" fill="#0f172a">pagamentos-db</text><text x="660" y="445" text-anchor="middle" font-size="10" fill="#64748b">Postgres</text>
+<line x1="560" y1="420" x2="600" y2="420" stroke="#475569" stroke-width="1.6"/>
+<line x1="242" y1="440" x2="328" y2="440" stroke="#a16207" stroke-width="1.8" stroke-dasharray="6 4" marker-start="url(#ar)" marker-end="url(#ar)"/>
+<rect x="330" y="530" width="230" height="100" rx="10" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+<text x="445" y="566" text-anchor="middle" font-size="17" font-weight="700" fill="#0f172a">Notificações</text>
+<text x="445" y="588" text-anchor="middle" font-size="13" fill="#2563eb" font-weight="700">TypeScript</text>
+<text x="445" y="609" text-anchor="middle" font-size="12" fill="#334155">e-mail simulado + contrato</text>
+<path d="M600,542 a60,9 0 0,0 120,0 v38 a60,9 0 0,1 -120,0 z" fill="#f8fafc" stroke="#475569"/><ellipse cx="660" cy="542" rx="60" ry="9" fill="#e2e8f0" stroke="#475569"/>
+<text x="660" y="570" text-anchor="middle" font-size="12" fill="#0f172a">notificacoes-db</text><text x="660" y="585" text-anchor="middle" font-size="10" fill="#64748b">Postgres</text>
+<line x1="560" y1="560" x2="600" y2="560" stroke="#475569" stroke-width="1.6"/>
+<line x1="242" y1="580" x2="328" y2="580" stroke="#a16207" stroke-width="1.8" stroke-dasharray="6 4" marker-end="url(#ar)"/>
+<text x="285" y="152" text-anchor="middle" font-size="11" fill="#a16207">eventos</text>
+<rect x="820" y="110" width="300" height="100" rx="10" fill="#fef9c3" stroke="#a16207" stroke-width="1.6"/>
+<text x="970" y="148" text-anchor="middle" font-size="15" font-weight="700" fill="#0f172a">SSM Parameter Store</text>
+<text x="970" y="170" text-anchor="middle" font-size="12" fill="#334155">timeout da saga, preços, tentativas</text>
+<text x="970" y="188" text-anchor="middle" font-size="12" fill="#334155">chave do gateway (SecureString)</text>
+<rect x="820" y="390" width="300" height="100" rx="10" fill="#fee2e2" stroke="#dc2626" stroke-width="1.6"/>
+<text x="970" y="428" text-anchor="middle" font-size="15" font-weight="700" fill="#0f172a">Gateway de pagamento</text>
+<text x="970" y="450" text-anchor="middle" font-size="12" fill="#334155">dependência externa simulada (Python)</text>
+<text x="970" y="468" text-anchor="middle" font-size="12" fill="#334155">latência e falha por variável de ambiente</text>
+<rect x="820" y="530" width="300" height="100" rx="10" fill="#fef9c3" stroke="#a16207" stroke-width="1.6"/>
+<text x="970" y="568" text-anchor="middle" font-size="15" font-weight="700" fill="#0f172a">S3 · locacao-contratos</text>
+<text x="970" y="590" text-anchor="middle" font-size="12" fill="#334155">contrato HTML de cada</text>
+<text x="970" y="608" text-anchor="middle" font-size="12" fill="#334155">reserva confirmada</text>
+<text x="970" y="98" text-anchor="middle" font-size="11" fill="#a16207" font-weight="700">MINISTACK · CONFIGURAÇÃO</text>
+<text x="970" y="660" text-anchor="middle" font-size="11" fill="#a16207" font-weight="700">MINISTACK · ARMAZENAMENTO</text>
+<line x1="560" y1="175" x2="818" y2="175" stroke="#334155" stroke-width="1.4" marker-end="url(#ar)"/><text x="760" y="168" font-size="11" fill="#334155">lê config</text>
+<polyline points="560,458 780,458 780,200 818,200" fill="none" stroke="#334155" stroke-width="1.4" marker-end="url(#ar)"/>
+<line x1="560" y1="478" x2="818" y2="478" stroke="#dc2626" stroke-width="1.8" marker-end="url(#ar)"/><text x="806" y="496" text-anchor="end" font-size="11" fill="#dc2626">HTTP + Idempotency-Key</text>
+<line x1="560" y1="610" x2="818" y2="610" stroke="#334155" stroke-width="1.4" marker-end="url(#ar)"/><text x="740" y="603" font-size="11" fill="#334155">grava</text>
+<text x="40" y="690" font-size="12" fill="#475569">Tracejado: mensagens assíncronas (envelope messageId, correlationId, type, version, occurredAt, payload). Nenhum serviço acessa o banco de outro.</text>
+</svg>
