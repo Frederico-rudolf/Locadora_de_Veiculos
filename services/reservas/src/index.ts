@@ -8,7 +8,7 @@
 //   EXPIRADA/CANCELADA + PagamentoAprovado tardio --> EstornoSolicitado (F7)
 import express from "express";
 import { randomUUID } from "crypto";
-import { PoolClient } from "pg";
+import { Pool, PoolClient } from "pg";
 import {
   COMMON_SQL, Envelope, Handler, PoisonMessage, brokerStatus, config, enqueue, getParam, log, migrate,
   pool, requireFields, resolveBroker, sleep, startConsumer, startOutboxRelay, withTx,
@@ -43,6 +43,37 @@ CREATE TABLE IF NOT EXISTS reserva_historico (
   causa      text NOT NULL,
   em         timestamptz NOT NULL DEFAULT now()
 );
+-- CQRS: reservas alteradas que ainda precisam ser copiadas para o modelo de leitura.
+-- Gravada na MESMA transação da mudança, então nenhuma alteração escapa da projeção.
+CREATE TABLE IF NOT EXISTS projecao_pendente (
+  reserva_id uuid PRIMARY KEY,
+  marcada_em timestamptz NOT NULL DEFAULT now()
+);
+`;
+
+// Modelo de leitura (CQRS): banco SEPARADO, desnormalizado, otimizado para as consultas da API.
+const SQL_LEITURA = `
+CREATE TABLE IF NOT EXISTS reservas_view (
+  reserva_id         uuid PRIMARY KEY,
+  status             text NOT NULL,
+  motivo             text,
+  cliente_id         text NOT NULL,
+  cliente_email      text,
+  filial             text NOT NULL,
+  categoria          text NOT NULL,
+  data_inicio        text NOT NULL,
+  data_fim           text NOT NULL,
+  valor_total        numeric(12,2) NOT NULL,
+  transacao_id       text,
+  expira_em          timestamptz,
+  estorno_solicitado boolean NOT NULL,
+  criado_em          timestamptz NOT NULL,
+  atualizado_em      timestamptz NOT NULL,
+  historico          jsonb NOT NULL,
+  projetado_em       timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS reservas_view_cliente ON reservas_view (cliente_id, criado_em DESC);
+CREATE INDEX IF NOT EXISTS reservas_view_status ON reservas_view (status);
 `;
 
 const CATEGORIAS = ["HATCH", "SEDAN", "SUV"];
@@ -70,6 +101,11 @@ async function lockReserva(c: PoolClient, id: string): Promise<Reserva> {
   return rows[0];
 }
 
+/** CQRS: marca a reserva para o projetor copiar o novo estado para o banco de leitura. */
+async function marcarProjecao(c: PoolClient, id: string) {
+  await c.query("INSERT INTO projecao_pendente (reserva_id) VALUES ($1) ON CONFLICT DO NOTHING", [id]);
+}
+
 async function transicao(c: PoolClient, r: Reserva, para: string, causa: string, extra: Record<string, unknown> = {}) {
   const sets = ["status = $2", "atualizado_em = now()"];
   const vals: unknown[] = [r.id, para];
@@ -79,6 +115,7 @@ async function transicao(c: PoolClient, r: Reserva, para: string, causa: string,
   }
   await c.query(`UPDATE reservas SET ${sets.join(", ")} WHERE id = $1`, vals);
   await c.query("INSERT INTO reserva_historico (reserva_id, de, para, causa) VALUES ($1,$2,$3,$4)", [r.id, r.status, para, causa]);
+  await marcarProjecao(c, r.id);
   log("info", "transição de estado", { correlationId: r.id, de: r.status, para, causa });
 }
 
@@ -131,6 +168,7 @@ const handlers: Record<string, Handler> = {
       await c.query("INSERT INTO reserva_historico (reserva_id, de, para, causa) VALUES ($1,$2,$2,$3)", [
         r.id, r.status, "PagamentoAprovado tardio -> EstornoSolicitado",
       ]);
+      await marcarProjecao(c, r.id);
       await enqueue(c, "EstornoSolicitado", 1, r.id, { reservaId: r.id, motivo: `PAGAMENTO_TARDIO_RESERVA_${r.status}` });
       log("warn", "pagamento aprovado após expiração: estorno solicitado", { correlationId: r.id });
     }
@@ -170,6 +208,86 @@ function startExpiracao() {
   })();
 }
 
+// ------------------------------------------------------------------ CQRS: projetor do modelo de leitura
+// Lado de escrita: tabelas reservas/reserva_historico (banco reservas-db), normalizadas, com locks e máquina de estados.
+// Lado de leitura: reservas_view (banco reservas-leitura-db), uma linha pronta por reserva com o histórico embutido.
+// O projetor copia o ESTADO ATUAL (não aplica deltas), então reprocessar é sempre seguro (idempotente),
+// e a ordem em que as reservas são projetadas não importa.
+const leitura = new Pool({ connectionString: process.env.READ_DATABASE_URL ?? config.databaseUrl, max: 10 });
+const projecao = { ultimaProjecao: 0 };
+
+async function migrarLeitura() {
+  for (let i = 1; ; i++) {
+    try {
+      const c = await leitura.connect();
+      try {
+        await c.query("BEGIN");
+        await c.query("SELECT pg_advisory_xact_lock(43)");
+        await c.query(SQL_LEITURA);
+        await c.query("COMMIT");
+      } finally {
+        c.release();
+      }
+      return;
+    } catch (e) {
+      log("warn", "banco de leitura indisponível, tentando de novo", { tentativa: i, erro: String(e) });
+      await sleep(Math.min(1000 * i, 5000));
+    }
+  }
+}
+
+async function projetarLote(): Promise<number> {
+  return withTx(async (c) => {
+    const { rows: ids } = await c.query(
+      "SELECT reserva_id FROM projecao_pendente ORDER BY marcada_em LIMIT 100 FOR UPDATE SKIP LOCKED"
+    );
+    if (!ids.length) return 0;
+    const lista = ids.map((r) => r.reserva_id);
+    const { rows } = await c.query(
+      `SELECT r.id, r.status, r.motivo, r.cliente_id, r.cliente_email, r.filial, r.categoria,
+              to_char(r.data_inicio,'YYYY-MM-DD') AS data_inicio, to_char(r.data_fim,'YYYY-MM-DD') AS data_fim,
+              r.valor_total, r.transacao_id, r.expira_em, r.estorno_solicitado, r.criado_em, r.atualizado_em,
+              COALESCE((SELECT jsonb_agg(jsonb_build_object('de', h.de, 'para', h.para, 'causa', h.causa, 'em', h.em) ORDER BY h.id)
+                          FROM reserva_historico h WHERE h.reserva_id = r.id), '[]'::jsonb) AS historico
+         FROM reservas r WHERE r.id = ANY($1::uuid[])`,
+      [lista]
+    );
+    for (const r of rows) {
+      // upsert do estado completo; o WHERE impede que uma cópia mais velha sobrescreva uma mais nova
+      await leitura.query(
+        `INSERT INTO reservas_view (reserva_id, status, motivo, cliente_id, cliente_email, filial, categoria, data_inicio,
+                                    data_fim, valor_total, transacao_id, expira_em, estorno_solicitado, criado_em, atualizado_em, historico)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+         ON CONFLICT (reserva_id) DO UPDATE SET
+           status = EXCLUDED.status, motivo = EXCLUDED.motivo, transacao_id = EXCLUDED.transacao_id,
+           expira_em = EXCLUDED.expira_em, estorno_solicitado = EXCLUDED.estorno_solicitado,
+           atualizado_em = EXCLUDED.atualizado_em, historico = EXCLUDED.historico, projetado_em = now()
+         WHERE reservas_view.atualizado_em <= EXCLUDED.atualizado_em`,
+        [r.id, r.status, r.motivo, r.cliente_id, r.cliente_email, r.filial, r.categoria, r.data_inicio, r.data_fim,
+         r.valor_total, r.transacao_id, r.expira_em, r.estorno_solicitado, r.criado_em, r.atualizado_em, JSON.stringify(r.historico)]
+      );
+    }
+    // só remove as marcas depois de gravar no banco de leitura; se cair no meio, o lote é projetado de novo
+    await c.query("DELETE FROM projecao_pendente WHERE reserva_id = ANY($1::uuid[])", [lista]);
+    projecao.ultimaProjecao = Date.now();
+    return lista.length;
+  });
+}
+
+function startProjetor() {
+  (async () => {
+    for (;;) {
+      try {
+        const n = await projetarLote();
+        if (n === 0) await sleep(100);
+      } catch (e) {
+        log("warn", "projeção para o modelo de leitura falhou, tentando de novo", { erro: String(e) });
+        await sleep(1000);
+      }
+    }
+  })();
+}
+
 // ------------------------------------------------------------------ API HTTP
 const app = express();
 app.use(express.json());
@@ -203,6 +321,7 @@ app.post("/reservas", async (req, res) => {
         [id, idemKey, b.clienteId, b.clienteEmail ?? null, b.filial, b.categoria, b.dataInicio, b.dataFim, valorTotal]
       );
       await c.query("INSERT INTO reserva_historico (reserva_id, de, para, causa) VALUES ($1, NULL, 'PENDENTE', 'POST /reservas')", [id]);
+      await marcarProjecao(c, id);
       // a reserva e o evento são gravados juntos (outbox): ou os dois existem, ou nenhum
       await enqueue(c, "ReservaSolicitada", 1, id, {
         reservaId: id, clienteId: b.clienteId, clienteEmail: b.clienteEmail, filial: b.filial, categoria: b.categoria,
@@ -220,31 +339,65 @@ app.post("/reservas", async (req, res) => {
   }
 });
 
+// ---- consultas (CQRS): leem SOMENTE o banco de leitura, nunca as tabelas de escrita
+const COLUNAS_VIEW = `reserva_id AS "reservaId", status, motivo, cliente_id AS "clienteId", filial, categoria,
+  data_inicio AS "dataInicio", data_fim AS "dataFim", valor_total::float AS "valorTotal", transacao_id AS "transacaoId",
+  expira_em AS "expiraEm", estorno_solicitado AS "estornoSolicitado", criado_em AS "criadoEm",
+  atualizado_em AS "atualizadoEm", projetado_em AS "projetadoEm"`;
+
 app.get("/reservas/resumo", async (_req, res) => {
-  const { rows } = await pool.query("SELECT status, count(*)::int AS total FROM reservas GROUP BY status ORDER BY status");
-  res.json(Object.fromEntries(rows.map((r) => [r.status, r.total])));
+  try {
+    const { rows } = await leitura.query("SELECT status, count(*)::int AS total FROM reservas_view GROUP BY status ORDER BY status");
+    res.json(Object.fromEntries(rows.map((r) => [r.status, r.total])));
+  } catch (e) {
+    res.status(503).json({ erro: "modelo de leitura indisponível" });
+  }
+});
+
+app.get("/reservas", async (req, res) => {
+  const filtros: string[] = [];
+  const vals: unknown[] = [];
+  for (const [param, col] of [["clienteId", "cliente_id"], ["status", "status"], ["filial", "filial"], ["categoria", "categoria"]]) {
+    const v = req.query[param];
+    if (typeof v === "string" && v) {
+      vals.push(v);
+      filtros.push(`${col} = $${vals.length}`);
+    }
+  }
+  const limite = Math.min(Number(req.query.limite ?? 50) || 50, 500);
+  try {
+    const { rows } = await leitura.query(
+      `SELECT ${COLUNAS_VIEW} FROM reservas_view ${filtros.length ? "WHERE " + filtros.join(" AND ") : ""}
+        ORDER BY criado_em DESC LIMIT ${limite}`,
+      vals
+    );
+    res.json(rows);
+  } catch (e) {
+    res.status(503).json({ erro: "modelo de leitura indisponível" });
+  }
 });
 
 app.get("/reservas/:id", async (req, res) => {
   if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) return res.status(404).end();
-  const { rows } = await pool.query(
-    `SELECT id AS "reservaId", status, motivo, cliente_id AS "clienteId", filial, categoria,
-            to_char(data_inicio,'YYYY-MM-DD') AS "dataInicio", to_char(data_fim,'YYYY-MM-DD') AS "dataFim",
-            valor_total::float AS "valorTotal", transacao_id AS "transacaoId", expira_em AS "expiraEm",
-            estorno_solicitado AS "estornoSolicitado", criado_em AS "criadoEm", atualizado_em AS "atualizadoEm"
-       FROM reservas WHERE id = $1`,
-    [req.params.id]
-  );
-  if (!rows.length) return res.status(404).json({ erro: "reserva não encontrada" });
-  const hist = await pool.query("SELECT de, para, causa, em FROM reserva_historico WHERE reserva_id = $1 ORDER BY id", [req.params.id]);
-  res.json({ ...rows[0], historico: hist.rows });
+  try {
+    const { rows } = await leitura.query(`SELECT ${COLUNAS_VIEW}, historico FROM reservas_view WHERE reserva_id = $1`, [req.params.id]);
+    // logo após o 202 a projeção pode levar alguns milissegundos (consistência eventual)
+    if (!rows.length) return res.status(404).json({ erro: "reserva não encontrada (ou ainda não projetada; tente de novo)" });
+    res.json(rows[0]);
+  } catch (e) {
+    res.status(503).json({ erro: "modelo de leitura indisponível" });
+  }
 });
 
 app.get("/health", async (_req, res) => {
   try {
     await pool.query("SELECT 1");
     const pend = await pool.query("SELECT count(*)::int AS n FROM outbox WHERE publicado_em IS NULL");
-    res.json({ status: "UP", servico: "reservas", outboxPendente: pend.rows[0].n, broker: brokerStatus });
+    const proj = await pool.query("SELECT count(*)::int AS n FROM projecao_pendente");
+    res.json({
+      status: "UP", servico: "reservas", outboxPendente: pend.rows[0].n, broker: brokerStatus,
+      modeloLeitura: { pendentes: proj.rows[0].n, ultimaProjecao: projecao.ultimaProjecao },
+    });
   } catch (e) {
     res.status(503).json({ status: "DOWN", erro: String(e) });
   }
@@ -267,6 +420,10 @@ async function carregarConfig(primeira: boolean) {
 
 async function main() {
   await migrate(SQL);
+  await migrarLeitura();
+  // projeção inicial: garante que reservas antigas (de antes do modelo de leitura existir) também apareçam
+  await pool.query("INSERT INTO projecao_pendente (reserva_id) SELECT id FROM reservas ON CONFLICT DO NOTHING");
+  startProjetor();
   const port = Number(process.env.PORT ?? 3000);
   app.listen(port, () => log("info", `API ouvindo na porta ${port}`));
   await resolveBroker();

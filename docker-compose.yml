@@ -55,6 +55,7 @@ services:
 
   # ---------------------------------------------------------------- bancos (um por serviço)
   reservas-db: { <<: *pg }
+  reservas-leitura-db: { <<: *pg }  # CQRS: modelo de leitura separado do Reservas
   frota-db: { <<: *pg }
   pagamentos-db: { <<: *pg }
   notificacoes-db: { <<: *pg }
@@ -67,12 +68,14 @@ services:
     depends_on:
       <<: *after-infra
       reservas-db: { condition: service_healthy }
+      reservas-leitura-db: { condition: service_healthy }
     environment:
       <<: *aws
       SERVICE_NAME: reservas
       PORT: "3000"
       QUEUE_NAME: reservas-queue
       DATABASE_URL: postgres://app:${DB_PASSWORD:-app}@reservas-db:5432/app
+      READ_DATABASE_URL: postgres://app:${DB_PASSWORD:-app}@reservas-leitura-db:5432/app
       RESERVA_CONFIRMADA_VERSAO: ${RESERVA_CONFIRMADA_VERSAO:-2}
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
