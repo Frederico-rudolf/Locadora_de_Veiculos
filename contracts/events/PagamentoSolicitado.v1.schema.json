@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://locafacil.example/contracts/events/PagamentoSolicitado.v1.schema.json",
+  "title": "PagamentoSolicitado v1",
+  "description": "Reservas -> Pagamentos. Comando para cobrar a reserva.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "reservaId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "clienteId": {
+      "type": "string"
+    },
+    "valor": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    }
+  },
+  "required": [
+    "reservaId",
+    "clienteId",
+    "valor"
+  ]
+}

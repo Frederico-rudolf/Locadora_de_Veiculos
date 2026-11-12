@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://locafacil.example/contracts/events/PagamentoRecusado.v1.schema.json",
+  "title": "PagamentoRecusado v1",
+  "description": "Pagamentos -> Reservas.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "reservaId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "pagamentoId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "motivo": {
+      "type": "string",
+      "enum": [
+        "RECUSADO_PELO_EMISSOR",
+        "GATEWAY_INDISPONIVEL"
+      ]
+    }
+  },
+  "required": [
+    "reservaId",
+    "pagamentoId",
+    "motivo"
+  ]
+}

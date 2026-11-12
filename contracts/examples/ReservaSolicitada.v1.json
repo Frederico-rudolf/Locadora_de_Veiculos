@@ -1,0 +1,17 @@
+{
+  "messageId": "7b1e2f4a-3c5d-4e6f-8a9b-0c1d2e3f4a5b",
+  "correlationId": "0f8c9d7e-6b5a-4c3d-9e2f-1a0b9c8d7e6f",
+  "type": "ReservaSolicitada",
+  "version": 1,
+  "occurredAt": "2026-11-20T14:03:12.481Z",
+  "payload": {
+    "reservaId": "0f8c9d7e-6b5a-4c3d-9e2f-1a0b9c8d7e6f",
+    "clienteId": "cli-42",
+    "clienteEmail": "ana@example.com",
+    "filial": "BNU",
+    "categoria": "SUV",
+    "dataInicio": "2026-12-20",
+    "dataFim": "2026-12-22",
+    "valorTotal": 750
+  }
+}

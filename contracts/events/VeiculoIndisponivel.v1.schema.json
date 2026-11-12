@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://locafacil.example/contracts/events/VeiculoIndisponivel.v1.schema.json",
+  "title": "VeiculoIndisponivel v1",
+  "description": "Frota -> Reservas. Não há unidade livre em algum dia do período.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "reservaId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "motivo": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "reservaId",
+    "motivo"
+  ]
+}

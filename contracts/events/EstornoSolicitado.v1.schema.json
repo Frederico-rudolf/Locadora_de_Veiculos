@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://locafacil.example/contracts/events/EstornoSolicitado.v1.schema.json",
+  "title": "EstornoSolicitado v1",
+  "description": "Reservas -> Pagamentos. Compensação de pagamento aprovado depois da expiração da reserva.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "reservaId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "motivo": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "reservaId",
+    "motivo"
+  ]
+}

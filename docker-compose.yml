@@ -1,0 +1,157 @@
+# LocaFácil – sobe tudo com:  docker compose up --build
+# Escalar consumidor (F8):    docker compose up -d --scale pagamentos=3
+
+x-aws: &aws
+  AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-http://ministack:4566}
+  AWS_REGION: ${AWS_REGION:-us-east-1}
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+  TOPIC_NAME: ${TOPIC_NAME:-locacao-eventos}
+
+x-pg: &pg
+  image: postgres:16-alpine
+  restart: unless-stopped
+  environment:
+    POSTGRES_USER: app
+    POSTGRES_PASSWORD: ${DB_PASSWORD:-app}
+    POSTGRES_DB: app
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U app -d app"]
+    interval: 3s
+    timeout: 3s
+    retries: 30
+
+x-after-infra: &after-infra
+  infra-init:
+    condition: service_completed_successfully
+
+services:
+  # ---------------------------------------------------------------- nuvem
+  ministack:
+    image: ministackorg/ministack:${MINISTACK_TAG:-latest}
+    ports: ["4566:4566"]
+    environment:
+      MINISTACK_REGION: ${AWS_REGION:-us-east-1}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4566/_ministack/health')"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  infra-init:
+    image: amazon/aws-cli:2.15.0
+    depends_on:
+      ministack:
+        condition: service_healthy
+    environment:
+      <<: *aws
+      MAX_RECEIVE_COUNT: ${MAX_RECEIVE_COUNT:-3}
+      RESERVA_TIMEOUT_SEGUNDOS: ${RESERVA_TIMEOUT_SEGUNDOS:-30}
+      PAGAMENTO_MAX_TENTATIVAS: ${PAGAMENTO_MAX_TENTATIVAS:-3}
+      GATEWAY_API_KEY: ${GATEWAY_API_KEY:-gw-chave-dev}
+    volumes:
+      - ./infra:/infra:ro
+    entrypoint: ["bash", "/infra/init-ministack.sh"]
+
+  # ---------------------------------------------------------------- bancos (um por serviço)
+  reservas-db: { <<: *pg }
+  reservas-leitura-db: { <<: *pg }  # CQRS: modelo de leitura separado do Reservas
+  frota-db: { <<: *pg }
+  pagamentos-db: { <<: *pg }
+  notificacoes-db: { <<: *pg }
+
+  # ---------------------------------------------------------------- serviços
+  reservas:                       # TypeScript – API 202 + orquestrador da saga
+    build: ./services/reservas
+    restart: unless-stopped
+    ports: ["3000:3000"]
+    depends_on:
+      <<: *after-infra
+      reservas-db: { condition: service_healthy }
+      reservas-leitura-db: { condition: service_healthy }
+    environment:
+      <<: *aws
+      SERVICE_NAME: reservas
+      PORT: "3000"
+      QUEUE_NAME: reservas-queue
+      DATABASE_URL: postgres://app:${DB_PASSWORD:-app}@reservas-db:5432/app
+      READ_DATABASE_URL: postgres://app:${DB_PASSWORD:-app}@reservas-leitura-db:5432/app
+      RESERVA_CONFIRMADA_VERSAO: ${RESERVA_CONFIRMADA_VERSAO:-2}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      retries: 20
+
+  frota:                          # Java / Spring Boot – disponibilidade e bloqueio
+    build: ./services/frota
+    restart: unless-stopped
+    ports: ["8081:8080"]
+    depends_on:
+      <<: *after-infra
+      frota-db: { condition: service_healthy }
+    environment:
+      <<: *aws
+      SERVICE_NAME: frota
+      QUEUE_NAME: frota-queue
+      DB_URL: jdbc:postgresql://frota-db:5432/app
+      DB_USER: app
+      DB_PASSWORD: ${DB_PASSWORD:-app}
+      CONSUMER_THREADS: ${FROTA_CONSUMER_THREADS:-4}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 5s
+      retries: 30
+
+  pagamentos:                     # Python – consumidor com 2+ réplicas (R4)
+    build: ./services/pagamentos
+    restart: unless-stopped
+    deploy:
+      replicas: ${PAGAMENTOS_REPLICAS:-2}
+    depends_on:
+      <<: *after-infra
+      pagamentos-db: { condition: service_healthy }
+    environment:
+      <<: *aws
+      SERVICE_NAME: pagamentos
+      QUEUE_NAME: pagamentos-queue
+      DATABASE_URL: postgresql://app:${DB_PASSWORD:-app}@pagamentos-db:5432/app
+      GATEWAY_URL: http://gateway-pagamento:8090
+      GATEWAY_TIMEOUT_SEGUNDOS: ${GATEWAY_TIMEOUT_SEGUNDOS:-10}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 5s
+      retries: 20
+
+  gateway-pagamento:              # Python – dependência externa instável (R5)
+    build: ./services/gateway-pagamento
+    restart: unless-stopped
+    ports: ["8090:8090"]
+    environment:
+      GATEWAY_LATENCIA_MS: ${GATEWAY_LATENCIA_MS:-800}
+      GATEWAY_JITTER_MS: ${GATEWAY_JITTER_MS:-700}
+      GATEWAY_TAXA_FALHA: ${GATEWAY_TAXA_FALHA:-0.2}
+      GATEWAY_TAXA_RECUSA: ${GATEWAY_TAXA_RECUSA:-0.05}
+      GATEWAY_API_KEY: ${GATEWAY_API_KEY:-gw-chave-dev}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/health')"]
+      interval: 5s
+      retries: 20
+
+  notificacoes:                   # TypeScript – e-mail simulado + contrato no S3
+    build: ./services/notificacoes
+    restart: unless-stopped
+    ports: ["3001:3000"]
+    depends_on:
+      <<: *after-infra
+      notificacoes-db: { condition: service_healthy }
+    environment:
+      <<: *aws
+      SERVICE_NAME: notificacoes
+      PORT: "3000"
+      QUEUE_NAME: notificacoes-queue
+      DATABASE_URL: postgres://app:${DB_PASSWORD:-app}@notificacoes-db:5432/app
+      BUCKET_CONTRATOS: ${BUCKET_CONTRATOS:-locacao-contratos}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      retries: 20
