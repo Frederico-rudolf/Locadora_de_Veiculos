@@ -11,6 +11,7 @@
 import json
 import os
 import re
+import signal
 import socket
 import threading
 import time
@@ -39,6 +40,10 @@ GATEWAY_TIMEOUT = float(os.getenv("GATEWAY_TIMEOUT_SEGUNDOS", "10"))
 
 state = {"topic_arn": None, "queue_url": None, "max_tentativas": 3, "api_key": os.getenv("GATEWAY_API_KEY", "gw-chave-dev"),
          "broker_ok": 0.0, "broker_erro": ""}
+
+# desligamento gracioso: no SIGTERM (docker stop / autoscaler reduzindo réplicas) para de receber,
+# termina a mensagem em andamento e devolve à fila as que ainda não começou
+parando = threading.Event()
 
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
@@ -348,17 +353,30 @@ def _handle(conn, m, span):
                 pass
 
 
+def devolver(msgs):
+    """Torna visíveis de novo, na hora, mensagens recebidas mas não processadas (outra réplica pega)."""
+    for m in msgs:
+        try:
+            sqs.change_message_visibility(QueueUrl=state["queue_url"], ReceiptHandle=m["ReceiptHandle"], VisibilityTimeout=0)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def consumer_loop():
     conn = connect()
     backoff = 1
-    while True:
+    while not parando.is_set():
         try:
-            r = sqs.receive_message(QueueUrl=state["queue_url"], MaxNumberOfMessages=5, WaitTimeSeconds=10,
+            r = sqs.receive_message(QueueUrl=state["queue_url"], MaxNumberOfMessages=5, WaitTimeSeconds=5,
                                     MessageSystemAttributeNames=["ApproximateReceiveCount"],
                                     MessageAttributeNames=["All"])
             state["broker_ok"] = time.time()
             backoff = 1
-            for m in r.get("Messages", []):
+            msgs = r.get("Messages", [])
+            for i, m in enumerate(msgs):
+                if parando.is_set():
+                    devolver(msgs[i:])
+                    break
                 handle(conn, m)
         except psycopg.OperationalError as e:
             log("warn", "conexão com banco perdida, reconectando", erro=str(e))
@@ -440,8 +458,13 @@ def main():
     resolve_broker()
     load_params()
     threading.Thread(target=relay_loop, daemon=True, name="relay").start()
+    signal.signal(signal.SIGTERM, lambda *_: parando.set())
     log("info", "consumidor iniciado", fila=QUEUE_NAME, gateway=GATEWAY_URL)
     consumer_loop()
+    log("info", "SIGTERM recebido: consumo encerrado sem perder mensagens")
+    provider = trace.get_tracer_provider()
+    if hasattr(provider, "shutdown"):
+        provider.shutdown()  # exporta os últimos spans
 
 
 if __name__ == "__main__":

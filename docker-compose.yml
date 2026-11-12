@@ -121,6 +121,7 @@ services:
   pagamentos:                     # Python – consumidor com 2+ réplicas (R4)
     build: ./services/pagamentos
     restart: unless-stopped
+    stop_grace_period: 30s        # SIGTERM: termina a mensagem atual e devolve as outras à fila
     deploy:
       replicas: ${PAGAMENTOS_REPLICAS:-2}
     depends_on:
@@ -173,3 +174,24 @@ services:
       test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 5s
       retries: 20
+
+  # ---------------------------------------------------------------- bônus: autoescala
+  # Opcional (perfil): docker compose --profile autoscale up -d
+  autoscaler:                     # Python – escala pagamentos conforme a profundidade da pagamentos-queue
+    build: ./services/autoscaler
+    profiles: ["autoscale"]
+    restart: unless-stopped
+    ports: ["8091:8080"]
+    depends_on: { <<: *after-infra }
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./:/projeto:ro
+    environment:
+      <<: *aws
+      QUEUE_NAME: pagamentos-queue
+      ALVO_SERVICO: pagamentos
+      MIN_REPLICAS: ${AUTOSCALE_MIN:-2}
+      MAX_REPLICAS: ${AUTOSCALE_MAX:-6}
+      MENSAGENS_POR_REPLICA: ${AUTOSCALE_MSGS_POR_REPLICA:-5}
+      INTERVALO_SEGUNDOS: "5"
+      ESFRIAMENTO_SEGUNDOS: ${AUTOSCALE_ESFRIAMENTO:-30}
