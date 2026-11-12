@@ -13,6 +13,7 @@ import {
 } from "@aws-sdk/client-sqs";
 import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 import { NodeHttpHandler } from "@smithy/node-http-handler";
+import { ROOT_CONTEXT, SpanKind, SpanStatusCode, context, propagation, trace, Context } from "@opentelemetry/api";
 
 // ------------------------------------------------------------------ config
 export const SERVICE = process.env.SERVICE_NAME ?? "servico";
@@ -37,6 +38,21 @@ export function log(level: "info" | "warn" | "error", msg: string, extra: Record
 }
 
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// ------------------------------------------------------------------ tracing (OpenTelemetry)
+// O contexto do trace viaja como atributo "traceparent" da mensagem SNS/SQS (o envelope não muda).
+// Ele é capturado quando o evento entra na outbox, então o trace continua mesmo que o relay publique depois.
+export const tracer = trace.getTracer(SERVICE);
+
+export function traceparentAtual(): string | null {
+  const carrier: Record<string, string> = {};
+  propagation.inject(context.active(), carrier);
+  return carrier.traceparent ?? null;
+}
+
+export function contextoDe(traceparent: string | null | undefined): Context {
+  return traceparent ? propagation.extract(ROOT_CONTEXT, { traceparent }) : ROOT_CONTEXT;
+}
 
 // ------------------------------------------------------------------ banco
 export const pool = new Pool({ connectionString: config.databaseUrl, max: 15 });
@@ -87,6 +103,7 @@ CREATE TABLE IF NOT EXISTS outbox (
   publicado_em timestamptz,
   tentativas   int NOT NULL DEFAULT 0
 );
+ALTER TABLE outbox ADD COLUMN IF NOT EXISTS traceparent text;
 CREATE INDEX IF NOT EXISTS outbox_pendentes ON outbox (id) WHERE publicado_em IS NULL;
 `;
 
@@ -155,7 +172,9 @@ export async function enqueue(c: PoolClient, type: string, version: number, corr
     occurredAt: new Date().toISOString(),
     payload,
   };
-  await c.query("INSERT INTO outbox (message_id, tipo, corpo) VALUES ($1, $2, $3)", [env.messageId, type, env]);
+  await c.query("INSERT INTO outbox (message_id, tipo, corpo, traceparent) VALUES ($1, $2, $3, $4)", [
+    env.messageId, type, env, traceparentAtual(),
+  ]);
   return env;
 }
 
@@ -166,23 +185,44 @@ async function relayOnce(): Promise<number> {
   return withTx(async (c) => {
     // SKIP LOCKED: várias réplicas drenam a outbox sem publicar a mesma linha ao mesmo tempo
     const { rows } = await c.query(
-      `SELECT id, tipo, corpo FROM outbox WHERE publicado_em IS NULL ORDER BY id LIMIT 25 FOR UPDATE SKIP LOCKED`
+      `SELECT id, tipo, corpo, traceparent FROM outbox WHERE publicado_em IS NULL ORDER BY id LIMIT 25 FOR UPDATE SKIP LOCKED`
     );
     let enviados = 0;
     for (const row of rows) {
+      // span PRODUCER filho da operação que gerou o evento; o traceparent dele vai junto da mensagem
+      const span = row.traceparent
+        ? tracer.startSpan(`${row.tipo} publish`, {
+            kind: SpanKind.PRODUCER,
+            attributes: {
+              "messaging.system": "aws_sns", "messaging.destination.name": config.topicName,
+              "messaging.message.id": row.corpo.messageId, "locafacil.correlation_id": row.corpo.correlationId,
+            },
+          }, contextoDe(row.traceparent))
+        : undefined;
+      const attrs: Record<string, { DataType: string; StringValue: string }> = {
+        type: { DataType: "String", StringValue: row.tipo },
+      };
+      if (span) {
+        const carrier: Record<string, string> = {};
+        propagation.inject(trace.setSpan(ROOT_CONTEXT, span), carrier);
+        if (carrier.traceparent) attrs.traceparent = { DataType: "String", StringValue: carrier.traceparent };
+      }
       try {
         await sns.send(
           new PublishCommand({
             TopicArn: topicArn,
             Message: JSON.stringify(row.corpo),
-            MessageAttributes: { type: { DataType: "String", StringValue: row.tipo } },
+            MessageAttributes: attrs,
           })
         );
+        span?.end();
         await c.query("UPDATE outbox SET publicado_em = now() WHERE id = $1", [row.id]);
         brokerStatus.ultimoSucesso = Date.now();
         enviados++;
       } catch (e) {
         // broker fora: a linha fica pendente e é publicada quando ele voltar (F6)
+        span?.setStatus({ code: SpanStatusCode.ERROR, message: String(e) });
+        span?.end();
         await c.query("UPDATE outbox SET tentativas = tentativas + 1 WHERE id = $1", [row.id]);
         brokerStatus.ultimoErro = String(e);
         log("warn", "falha ao publicar, outbox vai tentar de novo", { tipo: row.tipo, erro: String(e) });
@@ -246,10 +286,27 @@ export function requireFields(p: any, spec: Record<string, "uuid" | "string" | "
 }
 
 async function handleMessage(m: Message, handlers: Record<string, Handler>) {
+  // span CONSUMER continua o trace de quem publicou (atributo traceparent da mensagem)
+  const parent = contextoDe(m.MessageAttributes?.traceparent?.StringValue);
+  const span = tracer.startSpan("mensagem process", {
+    kind: SpanKind.CONSUMER,
+    attributes: { "messaging.system": "aws_sqs", "messaging.destination.name": config.queueName },
+  }, parent);
+  try {
+    await context.with(trace.setSpan(parent, span), () => processar(m, handlers, span));
+  } finally {
+    span.end();
+  }
+}
+
+async function processar(m: Message, handlers: Record<string, Handler>, span: ReturnType<typeof tracer.startSpan>) {
   const receiveCount = Number(m.Attributes?.ApproximateReceiveCount ?? "1");
+  span.setAttribute("messaging.message.delivery_count", receiveCount);
   let env: Envelope | undefined;
   try {
     env = parseBody(m.Body);
+    span.updateName(`${env.type} process`);
+    span.setAttributes({ "messaging.message.id": env.messageId, "locafacil.correlation_id": env.correlationId, "locafacil.event_version": env.version });
     const h = handlers[env.type];
     if (!h) {
       log("info", "tipo não interessa a este serviço, descartando", { type: env.type });
@@ -264,6 +321,7 @@ async function handleMessage(m: Message, handlers: Record<string, Handler>) {
           [e.messageId, e.type]
         );
         if (r.rowCount === 0) {
+          span.setAttribute("locafacil.duplicada", true);
           log("info", "mensagem duplicada ignorada", { messageId: e.messageId, type: e.type, correlationId: e.correlationId });
           return;
         }
@@ -273,6 +331,8 @@ async function handleMessage(m: Message, handlers: Record<string, Handler>) {
     }
     await sqs.send(new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: m.ReceiptHandle }));
   } catch (e) {
+    span.setStatus({ code: SpanStatusCode.ERROR, message: String(e) });
+    if (e instanceof PoisonMessage) span.setAttribute("locafacil.venenosa", true);
     // não apaga: volta para a fila após o visibility timeout; após maxReceiveCount vai para a DLQ
     log(e instanceof PoisonMessage ? "warn" : "error", "falha ao processar mensagem", {
       messageId: env?.messageId ?? m.MessageId,
@@ -301,6 +361,7 @@ export function startConsumer(handlers: Record<string, Handler>) {
             MaxNumberOfMessages: 10,
             WaitTimeSeconds: 10,
             MessageSystemAttributeNames: ["ApproximateReceiveCount"],
+            MessageAttributeNames: ["All"],
           })
         );
         backoff = 1000;

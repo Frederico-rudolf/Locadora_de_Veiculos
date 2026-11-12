@@ -17,7 +17,12 @@ import org.springframework.transaction.support.TransactionTemplate;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.SpanKind;
+import io.opentelemetry.api.trace.StatusCode;
+import io.opentelemetry.context.Scope;
 import software.amazon.awssdk.services.sqs.SqsClient;
+import software.amazon.awssdk.services.sqs.model.MessageAttributeValue;
 import software.amazon.awssdk.services.sqs.model.ChangeMessageVisibilityRequest;
 import software.amazon.awssdk.services.sqs.model.DeleteMessageRequest;
 import software.amazon.awssdk.services.sqs.model.Message;
@@ -40,9 +45,11 @@ public class MessageConsumer {
     private final FrotaService frota;
     private final ObjectMapper json;
     private final int threads;
+    private final Tracing tracing;
 
     public MessageConsumer(SqsClient sqs, Broker broker, JdbcTemplate jdbc, TransactionTemplate tx, FrotaService frota,
-                           ObjectMapper json, @Value("${locafacil.consumer-threads}") int threads) {
+                           ObjectMapper json, Tracing tracing, @Value("${locafacil.consumer-threads}") int threads) {
+        this.tracing = tracing;
         this.sqs = sqs;
         this.broker = broker;
         this.jdbc = jdbc;
@@ -70,6 +77,7 @@ public class MessageConsumer {
                         .maxNumberOfMessages(5)
                         .waitTimeSeconds(10)
                         .attributeNamesWithStrings("ApproximateReceiveCount")
+                        .messageAttributeNames("All")
                         .build()).messages();
                 backoff = 1000;
                 broker.ultimoSucesso = System.currentTimeMillis();
@@ -106,6 +114,21 @@ public class MessageConsumer {
     }
 
     private void handle(Message m) {
+        // span CONSUMER que continua o trace de quem publicou (atributo traceparent da mensagem)
+        MessageAttributeValue tp = m.messageAttributes().get("traceparent");
+        Span span = tracing.tracer().spanBuilder("mensagem process").setSpanKind(SpanKind.CONSUMER)
+                .setParent(tracing.contextoDe(tp == null ? null : tp.stringValue()))
+                .setAttribute("messaging.system", "aws_sqs")
+                .setAttribute("messaging.destination.name", "frota-queue")
+                .startSpan();
+        try (Scope ignored = span.makeCurrent()) {
+            handle(m, span);
+        } finally {
+            span.end();
+        }
+    }
+
+    private void handle(Message m, Span span) {
         String receiveCount = m.attributesAsStrings().getOrDefault("ApproximateReceiveCount", "1");
         String messageId = m.messageId();
         try {
@@ -113,6 +136,10 @@ public class MessageConsumer {
             messageId = env.get("messageId").asText();
             String type = env.get("type").asText();
             String correlationId = env.get("correlationId").asText();
+            span.updateName(type + " process");
+            span.setAttribute("messaging.message.id", messageId);
+            span.setAttribute("locafacil.correlation_id", correlationId);
+            span.setAttribute("messaging.message.delivery_count", Long.parseLong(receiveCount));
             if (!List.of("ReservaSolicitada", "ReservaConfirmada", "ReservaCancelada").contains(type)) {
                 log.info("tipo {} não interessa à frota, descartando", type);
             } else {
@@ -121,6 +148,7 @@ public class MessageConsumer {
                     int novo = jdbc.update(
                             "INSERT INTO mensagens_processadas (message_id, tipo) VALUES (?::uuid, ?) ON CONFLICT DO NOTHING", mid, type);
                     if (novo == 0) {
+                        span.setAttribute("locafacil.duplicada", true);
                         log.info("mensagem duplicada ignorada messageId={} correlationId={}", mid, correlationId);
                         return;
                     }
@@ -135,6 +163,8 @@ public class MessageConsumer {
             }
             sqs.deleteMessage(DeleteMessageRequest.builder().queueUrl(broker.queueUrl()).receiptHandle(m.receiptHandle()).build());
         } catch (PoisonMessageException e) {
+            span.setStatus(StatusCode.ERROR, e.getMessage());
+            span.setAttribute("locafacil.venenosa", true);
             log.warn("mensagem VENENOSA messageId={} receiveCount={}: {} (irá para a DLQ após o limite)", messageId, receiveCount, e.getMessage());
             try {
                 // volta para a fila em 2 s em vez de esperar o visibility timeout inteiro
@@ -142,6 +172,7 @@ public class MessageConsumer {
                         .queueUrl(broker.queueUrl()).receiptHandle(m.receiptHandle()).visibilityTimeout(2).build());
             } catch (Exception ignored) { }
         } catch (Exception e) {
+            span.setStatus(StatusCode.ERROR, e.toString());
             log.error("falha ao processar messageId={} receiveCount={}: {}", messageId, receiveCount, e.toString());
         }
     }

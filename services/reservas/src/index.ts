@@ -12,7 +12,9 @@ import { Pool, PoolClient } from "pg";
 import {
   COMMON_SQL, Envelope, Handler, PoisonMessage, brokerStatus, config, enqueue, getParam, log, migrate,
   pool, requireFields, resolveBroker, sleep, startConsumer, startOutboxRelay, withTx,
+  contextoDe, traceparentAtual, tracer,
 } from "./infra";
+import { SpanStatusCode, context, trace } from "@opentelemetry/api";
 
 const SQL = `
 ${COMMON_SQL}
@@ -34,6 +36,7 @@ CREATE TABLE IF NOT EXISTS reservas (
   criado_em          timestamptz NOT NULL DEFAULT now(),
   atualizado_em      timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE reservas ADD COLUMN IF NOT EXISTS traceparent text;  -- trace do POST, retomado na expiração
 CREATE INDEX IF NOT EXISTS reservas_expiracao ON reservas (expira_em) WHERE status = 'AGUARDANDO_PAGAMENTO';
 CREATE TABLE IF NOT EXISTS reserva_historico (
   id         bigserial PRIMARY KEY,
@@ -190,14 +193,26 @@ function startExpiracao() {
       try {
         await withTx(async (c) => {
           const { rows } = await c.query(
-            `SELECT id FROM reservas
+            `SELECT id, traceparent FROM reservas
               WHERE status = 'AGUARDANDO_PAGAMENTO' AND expira_em < now()
               ORDER BY expira_em LIMIT 100 FOR UPDATE SKIP LOCKED`
           );
-          for (const { id } of rows) {
-            const r = await lockReserva(c, id);
-            await transicao(c, r, "EXPIRADA", "timeout de pagamento", { motivo: "TIMEOUT_PAGAMENTO", expira_em: null });
-            await cancelar(c, r, "TIMEOUT_PAGAMENTO");
+          for (const { id, traceparent } of rows) {
+            // a expiração vira um span do MESMO trace da reserva, então a compensação aparece na mesma linha do tempo
+            const parent = contextoDe(traceparent);
+            const span = tracer.startSpan("reserva expirada (timeout da saga)", { attributes: { "locafacil.correlation_id": id } }, parent);
+            try {
+              await context.with(trace.setSpan(parent, span), async () => {
+                const r = await lockReserva(c, id);
+                await transicao(c, r, "EXPIRADA", "timeout de pagamento", { motivo: "TIMEOUT_PAGAMENTO", expira_em: null });
+                await cancelar(c, r, "TIMEOUT_PAGAMENTO");
+              });
+            } catch (e) {
+              span.setStatus({ code: SpanStatusCode.ERROR, message: String(e) });
+              throw e;
+            } finally {
+              span.end();
+            }
           }
         });
       } catch (e) {
@@ -316,9 +331,9 @@ app.post("/reservas", async (req, res) => {
       }
       const id = randomUUID();
       await c.query(
-        `INSERT INTO reservas (id, idempotency_key, cliente_id, cliente_email, filial, categoria, data_inicio, data_fim, valor_total, status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'PENDENTE')`,
-        [id, idemKey, b.clienteId, b.clienteEmail ?? null, b.filial, b.categoria, b.dataInicio, b.dataFim, valorTotal]
+        `INSERT INTO reservas (id, idempotency_key, cliente_id, cliente_email, filial, categoria, data_inicio, data_fim, valor_total, status, traceparent)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'PENDENTE',$10)`,
+        [id, idemKey, b.clienteId, b.clienteEmail ?? null, b.filial, b.categoria, b.dataInicio, b.dataFim, valorTotal, traceparentAtual()]
       );
       await c.query("INSERT INTO reserva_historico (reserva_id, de, para, causa) VALUES ($1, NULL, 'PENDENTE', 'POST /reservas')", [id]);
       await marcarProjecao(c, id);
@@ -327,6 +342,7 @@ app.post("/reservas", async (req, res) => {
         reservaId: id, clienteId: b.clienteId, clienteEmail: b.clienteEmail, filial: b.filial, categoria: b.categoria,
         dataInicio: b.dataInicio, dataFim: b.dataFim, valorTotal,
       });
+      trace.getActiveSpan()?.setAttribute("locafacil.correlation_id", id);
       return { id, status: "PENDENTE", repetida: false };
     });
     res.status(202).location(`/reservas/${out.id}`).json({

@@ -27,14 +27,16 @@ public class Broker {
     private final ObjectMapper json;
     private final String topicName;
     private final String queueName;
+    private final Tracing tracing;
     private volatile String topicArn;
     private volatile String queueUrl;
     volatile long ultimoSucesso;
     volatile String ultimoErro = "";
 
-    public Broker(SnsClient sns, SqsClient sqs, ObjectMapper json,
+    public Broker(SnsClient sns, SqsClient sqs, ObjectMapper json, Tracing tracing,
                   @Value("${locafacil.topic-name}") String topicName,
                   @Value("${locafacil.queue-name}") String queueName) {
+        this.tracing = tracing;
         this.sns = sns;
         this.sqs = sqs;
         this.json = json;
@@ -76,6 +78,8 @@ public class Broker {
         env.put("version", version);
         env.put("occurredAt", java.time.Instant.now().toString());
         env.set("payload", json.valueToTree(payload));
-        jdbc.update("INSERT INTO outbox (message_id, tipo, corpo) VALUES (?::uuid, ?, ?::jsonb)", messageId, type, env.toString());
+        // o traceparent da operação atual é gravado junto: o relay continua o mesmo trace ao publicar
+        jdbc.update("INSERT INTO outbox (message_id, tipo, corpo, traceparent) VALUES (?::uuid, ?, ?::jsonb, ?)",
+                messageId, type, env.toString(), tracing.traceparentAtual());
     }
 }

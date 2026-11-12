@@ -23,6 +23,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import boto3
 import psycopg
 from botocore.config import Config
+from opentelemetry import context as otel_context
+from opentelemetry import propagate, trace
+from opentelemetry.trace import SpanKind, Status, StatusCode
 
 SERVICE = os.getenv("SERVICE_NAME", "pagamentos")
 REPLICA = socket.gethostname()
@@ -55,6 +58,7 @@ CREATE TABLE IF NOT EXISTS outbox (
   publicado_em timestamptz,
   tentativas   int NOT NULL DEFAULT 0
 );
+ALTER TABLE outbox ADD COLUMN IF NOT EXISTS traceparent text;
 CREATE INDEX IF NOT EXISTS outbox_pendentes ON outbox (id) WHERE publicado_em IS NULL;
 CREATE TABLE IF NOT EXISTS pagamentos (
   id             uuid PRIMARY KEY,
@@ -78,6 +82,36 @@ def log(level, msg, **kw):
 
 class PoisonMessage(Exception):
     """Mensagem inválida: não é apagada; o SQS reentrega até maxReceiveCount e manda para a DLQ (F4)."""
+
+
+# --------------------------------------------------------------------------- tracing (OpenTelemetry)
+# O contexto do trace viaja no atributo "traceparent" da mensagem SNS/SQS; o envelope não muda.
+# Sem OTEL_EXPORTER_OTLP_ENDPOINT o tracer é no-op e o serviço funciona igual.
+def _init_tracing():
+    if not os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or os.getenv("OTEL_SDK_DISABLED") == "true":
+        return
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    provider = TracerProvider(resource=Resource.create({"service.name": os.getenv("OTEL_SERVICE_NAME", SERVICE),
+                                                        "service.instance.id": REPLICA}))
+    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+    trace.set_tracer_provider(provider)
+
+
+_init_tracing()
+tracer = trace.get_tracer(SERVICE)
+
+
+def traceparent_atual():
+    carrier = {}
+    propagate.inject(carrier)
+    return carrier.get("traceparent")
+
+
+def contexto_de(traceparent):
+    return propagate.extract({"traceparent": traceparent}) if traceparent else otel_context.Context()
 
 
 # --------------------------------------------------------------------------- AWS
@@ -140,27 +174,34 @@ def migrate():
 def enqueue(cur, tipo, version, correlation_id, payload):
     env = {"messageId": str(uuid.uuid4()), "correlationId": correlation_id, "type": tipo, "version": version,
            "occurredAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), "payload": payload}
-    cur.execute("INSERT INTO outbox (message_id, tipo, corpo) VALUES (%s, %s, %s)",
-                (env["messageId"], tipo, json.dumps(env)))
+    cur.execute("INSERT INTO outbox (message_id, tipo, corpo, traceparent) VALUES (%s, %s, %s, %s)",
+                (env["messageId"], tipo, json.dumps(env), traceparent_atual()))
 
 
 # --------------------------------------------------------------------------- gateway
 def gateway(path, body, idem_key=None):
-    """Uma chamada ao gateway. Retorna (http_status, corpo) ou (None, erro) em timeout/conexão."""
-    req = urllib.request.Request(GATEWAY_URL + path, data=json.dumps(body).encode(), method="POST",
-                                 headers={"Content-Type": "application/json",
-                                          "Authorization": f"Bearer {state['api_key']}",
-                                          **({"Idempotency-Key": idem_key} if idem_key else {})})
-    try:
-        with urllib.request.urlopen(req, timeout=GATEWAY_TIMEOUT) as r:
-            return r.status, json.loads(r.read() or b"{}")
-    except urllib.error.HTTPError as e:
+    """Uma chamada ao gateway (um span CLIENT por tentativa). Retorna (http_status, corpo) ou (None, erro)."""
+    with tracer.start_as_current_span(f"gateway POST {path}", kind=SpanKind.CLIENT,
+                                      attributes={"http.request.method": "POST", "url.full": GATEWAY_URL + path}) as span:
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {state['api_key']}",
+                   **({"Idempotency-Key": idem_key} if idem_key else {})}
+        propagate.inject(headers)  # o gateway recebe o traceparent (um parceiro real poderia continuar o trace)
+        req = urllib.request.Request(GATEWAY_URL + path, data=json.dumps(body).encode(), method="POST", headers=headers)
         try:
-            return e.code, json.loads(e.read() or b"{}")
-        except json.JSONDecodeError:
-            return e.code, {}
-    except Exception as e:  # noqa: BLE001  (timeout, conexão recusada...)
-        return None, {"erro": str(e)}
+            with urllib.request.urlopen(req, timeout=GATEWAY_TIMEOUT) as r:
+                span.set_attribute("http.response.status_code", r.status)
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            span.set_attribute("http.response.status_code", e.code)
+            if e.code >= 500:
+                span.set_status(Status(StatusCode.ERROR, f"HTTP {e.code}"))
+            try:
+                return e.code, json.loads(e.read() or b"{}")
+            except json.JSONDecodeError:
+                return e.code, {}
+        except Exception as e:  # noqa: BLE001  (timeout, conexão recusada...)
+            span.set_status(Status(StatusCode.ERROR, str(e)))
+            return None, {"erro": str(e)}
 
 
 def com_retentativas(path, body, idem_key, correlation_id):
@@ -259,10 +300,22 @@ def parse(body):
 
 
 def handle(conn, m):
+    # span CONSUMER que continua o trace de quem publicou a mensagem
+    tp = m.get("MessageAttributes", {}).get("traceparent", {}).get("StringValue")
+    with tracer.start_as_current_span("mensagem process", context=contexto_de(tp), kind=SpanKind.CONSUMER,
+                                      attributes={"messaging.system": "aws_sqs", "messaging.destination.name": QUEUE_NAME,
+                                                  "locafacil.replica": REPLICA}) as span:
+        _handle(conn, m, span)
+
+
+def _handle(conn, m, span):
     receive_count = int(m.get("Attributes", {}).get("ApproximateReceiveCount", "1"))
     env = None
     try:
         env = parse(m.get("Body"))
+        span.update_name(f"{env['type']} process")
+        span.set_attributes({"messaging.message.id": env["messageId"], "locafacil.correlation_id": env["correlationId"],
+                             "messaging.message.delivery_count": receive_count})
         h = HANDLERS.get(env["type"])
         if h is None:
             log("info", "tipo não interessa a este serviço, descartando", type=env["type"])
@@ -273,6 +326,7 @@ def handle(conn, m):
                 cur.execute("""INSERT INTO mensagens_processadas (message_id, tipo, processada_por) VALUES (%s,%s,%s)
                                ON CONFLICT DO NOTHING""", (env["messageId"], env["type"], REPLICA))
                 if cur.rowcount == 0:
+                    span.set_attribute("locafacil.duplicada", True)
                     log("info", "mensagem duplicada ignorada", messageId=env["messageId"], correlationId=env["correlationId"])
                 else:
                     h(cur, env)
@@ -282,6 +336,8 @@ def handle(conn, m):
     except psycopg.OperationalError:
         raise  # conexão com o banco caiu: o laço reconecta
     except Exception as e:  # noqa: BLE001
+        span.set_status(Status(StatusCode.ERROR, str(e)))
+        span.set_attribute("locafacil.venenosa", isinstance(e, PoisonMessage))
         log("warn" if isinstance(e, PoisonMessage) else "error", "falha ao processar mensagem",
             messageId=(env or {}).get("messageId", m.get("MessageId")), receiveCount=receive_count,
             venenosa=isinstance(e, PoisonMessage), erro=str(e))
@@ -298,7 +354,8 @@ def consumer_loop():
     while True:
         try:
             r = sqs.receive_message(QueueUrl=state["queue_url"], MaxNumberOfMessages=5, WaitTimeSeconds=10,
-                                    AttributeNames=["ApproximateReceiveCount"])
+                                    MessageSystemAttributeNames=["ApproximateReceiveCount"],
+                                    MessageAttributeNames=["All"])
             state["broker_ok"] = time.time()
             backoff = 1
             for m in r.get("Messages", []):
@@ -320,13 +377,27 @@ def relay_loop():
         try:
             enviados = 0
             with conn.transaction(), conn.cursor() as cur:
-                cur.execute("""SELECT id, tipo, corpo FROM outbox WHERE publicado_em IS NULL
+                cur.execute("""SELECT id, tipo, corpo, traceparent FROM outbox WHERE publicado_em IS NULL
                                ORDER BY id LIMIT 25 FOR UPDATE SKIP LOCKED""")
-                for oid, tipo, corpo in cur.fetchall():
+                for oid, tipo, corpo, tp in cur.fetchall():
+                    attrs = {"type": {"DataType": "String", "StringValue": tipo}}
+                    span = None
+                    if tp:  # span PRODUCER filho da operação que gerou o evento
+                        span = tracer.start_span(f"{tipo} publish", context=contexto_de(tp), kind=SpanKind.PRODUCER,
+                                                 attributes={"messaging.system": "aws_sns", "messaging.message.id": corpo["messageId"],
+                                                             "locafacil.correlation_id": corpo["correlationId"]})
+                        carrier = {}
+                        propagate.inject(carrier, context=trace.set_span_in_context(span))
+                        if carrier.get("traceparent"):
+                            attrs["traceparent"] = {"DataType": "String", "StringValue": carrier["traceparent"]}
                     try:
-                        sns.publish(TopicArn=state["topic_arn"], Message=json.dumps(corpo),
-                                    MessageAttributes={"type": {"DataType": "String", "StringValue": tipo}})
+                        sns.publish(TopicArn=state["topic_arn"], Message=json.dumps(corpo), MessageAttributes=attrs)
+                        if span:
+                            span.end()
                     except Exception as e:  # noqa: BLE001
+                        if span:
+                            span.set_status(Status(StatusCode.ERROR, str(e)))
+                            span.end()
                         cur.execute("UPDATE outbox SET tentativas = tentativas + 1 WHERE id = %s", (oid,))
                         log("warn", "falha ao publicar, outbox tenta de novo", tipo=tipo, erro=str(e))
                         break

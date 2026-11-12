@@ -8,6 +8,14 @@ x-aws: &aws
   AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
   TOPIC_NAME: ${TOPIC_NAME:-locacao-eventos}
 
+# Bônus: tracing distribuído (OpenTelemetry -> Jaeger). Para desligar: OTEL_SDK_DISABLED=true
+x-otel: &otel
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4318}
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+  OTEL_METRICS_EXPORTER: none
+  OTEL_LOGS_EXPORTER: none
+  OTEL_SDK_DISABLED: ${OTEL_SDK_DISABLED:-false}
+
 x-pg: &pg
   image: postgres:16-alpine
   restart: unless-stopped
@@ -53,6 +61,12 @@ services:
       - ./infra:/infra:ro
     entrypoint: ["bash", "/infra/init-ministack.sh"]
 
+  jaeger:                         # coleta OTLP e mostra os traces: http://localhost:16686
+    image: jaegertracing/all-in-one:${JAEGER_TAG:-1.62.0}
+    ports: ["16686:16686"]
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+
   # ---------------------------------------------------------------- bancos (um por serviço)
   reservas-db: { <<: *pg }
   reservas-leitura-db: { <<: *pg }  # CQRS: modelo de leitura separado do Reservas
@@ -70,8 +84,9 @@ services:
       reservas-db: { condition: service_healthy }
       reservas-leitura-db: { condition: service_healthy }
     environment:
-      <<: *aws
+      <<: [*aws, *otel]
       SERVICE_NAME: reservas
+      OTEL_SERVICE_NAME: reservas
       PORT: "3000"
       QUEUE_NAME: reservas-queue
       DATABASE_URL: postgres://app:${DB_PASSWORD:-app}@reservas-db:5432/app
@@ -90,8 +105,9 @@ services:
       <<: *after-infra
       frota-db: { condition: service_healthy }
     environment:
-      <<: *aws
+      <<: [*aws, *otel]
       SERVICE_NAME: frota
+      OTEL_SERVICE_NAME: frota
       QUEUE_NAME: frota-queue
       DB_URL: jdbc:postgresql://frota-db:5432/app
       DB_USER: app
@@ -111,8 +127,9 @@ services:
       <<: *after-infra
       pagamentos-db: { condition: service_healthy }
     environment:
-      <<: *aws
+      <<: [*aws, *otel]
       SERVICE_NAME: pagamentos
+      OTEL_SERVICE_NAME: pagamentos
       QUEUE_NAME: pagamentos-queue
       DATABASE_URL: postgresql://app:${DB_PASSWORD:-app}@pagamentos-db:5432/app
       GATEWAY_URL: http://gateway-pagamento:8090
@@ -145,8 +162,9 @@ services:
       <<: *after-infra
       notificacoes-db: { condition: service_healthy }
     environment:
-      <<: *aws
+      <<: [*aws, *otel]
       SERVICE_NAME: notificacoes
+      OTEL_SERVICE_NAME: notificacoes
       PORT: "3000"
       QUEUE_NAME: notificacoes-queue
       DATABASE_URL: postgres://app:${DB_PASSWORD:-app}@notificacoes-db:5432/app
