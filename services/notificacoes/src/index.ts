@@ -6,8 +6,9 @@ import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { PoolClient } from "pg";
 import {
   COMMON_SQL, Envelope, Handler, PoisonMessage, brokerStatus, config, log, migrate, pool,
-  requireFields, resolveBroker, startConsumer,
+  requireFields, resolveBroker, startConsumer, tracer,
 } from "./infra";
+import { SpanKind } from "@opentelemetry/api";
 
 const SQL = `
 ${COMMON_SQL}
@@ -77,7 +78,14 @@ const handlers: Record<string, Handler> = {
     const chave = `contratos/${r.reservaId}.html`;
     // chave determinística: regravar o mesmo contrato numa reentrega é inofensivo.
     // Se o S3 falhar, a exceção desfaz a transação e a mensagem volta para a fila.
-    await s3.send(new PutObjectCommand({ Bucket: bucket, Key: chave, Body: contratoHtml(r), ContentType: "text/html; charset=utf-8" }));
+    await tracer.startActiveSpan("S3 PutObject contrato", { kind: SpanKind.CLIENT, attributes: { "aws.s3.bucket": bucket, "aws.s3.key": chave } },
+      async (span) => {
+        try {
+          await s3.send(new PutObjectCommand({ Bucket: bucket, Key: chave, Body: contratoHtml(r), ContentType: "text/html; charset=utf-8" }));
+        } finally {
+          span.end();
+        }
+      });
     await registrar(c, e, "CONFIRMACAO", r.clienteEmail, `Reserva ${r.reservaId} confirmada (${r.categoria}, ${r.dataInicio} a ${r.dataFim})`,
       `Valor ${r.valor.moeda} ${r.valor.total}`, `s3://${bucket}/${chave}`);
   },

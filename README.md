@@ -9,11 +9,13 @@ assíncrona, compensação e uma dependência externa instável. Tudo roda local
 
 | Serviço | Linguagem | Banco | Papel |
 | --- | --- | --- | --- |
-| `reservas` | TypeScript (Node 20, Express) | `reservas-db` | API 202, orquestrador da saga, expiração |
+| `reservas` | TypeScript (Node 20, Express) | `reservas-db` (escrita) + `reservas-leitura-db` (leitura, CQRS) | API 202, orquestrador da saga, expiração |
 | `frota` | Java 21 (Spring Boot 3) | `frota-db` | Disponibilidade e bloqueio do recurso escasso |
 | `pagamentos` | Python 3.12 | `pagamentos-db` | Cobrança com retentativas e estorno, **2+ réplicas** |
 | `notificacoes` | TypeScript (Node 20) | `notificacoes-db` | E-mail simulado e contrato no S3 |
 | `gateway-pagamento` | Python (stdlib) | memória | Dependência externa simulada, lenta e instável |
+| `jaeger` | — | memória | Coleta e exibe os traces OpenTelemetry (bônus) |
+| `autoscaler` | Python | — | Escala `pagamentos` pelo tamanho da fila (bônus, perfil `autoscale`) |
 
 ## Como rodar
 
@@ -27,14 +29,16 @@ docker compose up --build          # sobe MiniStack, cria a infra, 4 bancos e to
 O contêiner `infra-init` roda `infra/init-ministack.sh` (AWS CLI) e cria tópico, filas, DLQs,
 assinaturas, bucket e parâmetros. Nada é criado à mão. Para recriar do zero: `docker compose down -v && docker compose up --build`.
 
-Portas: Reservas `3000`, Notificações `3001`, Frota `8081`, Gateway `8090`, MiniStack `4566`.
+Portas: Reservas `3000`, Notificações `3001`, Frota `8081`, Gateway `8090`, MiniStack `4566`,
+Jaeger `16686` (UI dos traces), Autoscaler `8091` (só com `--profile autoscale`).
 
 ```bash
 curl -i -X POST localhost:3000/reservas -H 'Content-Type: application/json' \
   -d '{"clienteId":"cli-1","clienteEmail":"ana@example.com","filial":"BNU","categoria":"SUV","dataInicio":"2026-12-20","dataFim":"2026-12-22"}'
 # HTTP/1.1 202 Accepted  Location: /reservas/<id>
-curl localhost:3000/reservas/<id>          # status + histórico de transições
+curl localhost:3000/reservas/<id>          # status + histórico de transições (modelo de leitura)
 curl localhost:3000/reservas/resumo        # contagem por status
+curl "localhost:3000/reservas?clienteId=cli-1&status=CONFIRMADA"   # listagem (modelo de leitura)
 curl "localhost:8081/ocupacao?filial=BNU&categoria=SUV"
 curl localhost:8090/cobrancas              # o que o gateway cobrou
 curl -X POST localhost:8090/config -d '{"taxa_falha":1.0}'   # muda a instabilidade ao vivo
@@ -123,12 +127,41 @@ As filas SQS são *standard*: não há garantia de ordem e pode haver duplicata.
 
 ## Bônus implementados
 
+Os cinco itens de bônus do enunciado estão implementados:
+
 - **Versionamento de eventos**: `ReservaConfirmada` v1 (`valorTotal: number`) e v2 (`valor: {total, moeda}`, `transacaoId`).
   O Reservas publica a versão de `RESERVA_CONFIRMADA_VERSAO` (padrão 2). A Frota é leitor tolerante (só usa `reservaId`),
   e Notificações tem um *upcaster* v1→v2. Para demonstrar: `RESERVA_CONFIRMADA_VERSAO=1 docker compose up -d reservas`, crie
   uma reserva e confira `versao_evento` em `GET :3001/notificacoes`.
 - **Infraestrutura como código**: `infra/terraform/main.tf` recria tópico, filas, DLQs, assinaturas, bucket e parâmetros
   (`terraform init && terraform apply` com o MiniStack no ar).
+- **Tracing distribuído (OpenTelemetry)**: os quatro serviços exportam spans via OTLP para o Jaeger
+  (<http://localhost:16686>). O envelope não muda: o contexto W3C (`traceparent`) é capturado quando o evento
+  entra na **outbox** (coluna `outbox.traceparent`) e viaja como *atributo da mensagem* SNS/SQS
+  (`RawMessageDelivery`). Cada publicação é um span `PRODUCER` (`<Evento> publish`) e cada consumo um span
+  `CONSUMER` (`<Evento> process`) filho dele, nas três linguagens:
+  `services/*/src/infra.ts` + `tracing.ts` (TypeScript), `Tracing.java`/`OutboxRelay.java`/`MessageConsumer.java` (Java),
+  `services/pagamentos/app/main.py` (Python, com um span por tentativa no gateway). A expiração da saga retoma o
+  trace do `POST` (coluna `reservas.traceparent`), então até a compensação do F7 aparece na mesma linha do tempo.
+  Para demonstrar: rode `./scripts/demo-fluxo-feliz.sh`, abra o Jaeger, serviço `reservas`, operação `POST /reservas`:
+  um único trace passa por Reservas → Frota → Reservas → Pagamentos (gateway) → Reservas → **Frota e Notificações**
+  (fan-out do `ReservaConfirmada`, com o `S3 PutObject contrato`). Desligar: `OTEL_SDK_DISABLED=true`.
+- **Modelo de leitura separado (CQRS)**: o Reservas escreve em `reservas-db` (tabelas normalizadas, locks, máquina de
+  estados) e **todas as consultas** (`GET /reservas`, `/reservas/:id`, `/reservas/resumo`) leem só o banco
+  `reservas-leitura-db`, numa tabela desnormalizada `reservas_view` com o histórico embutido em JSON. Cada mudança grava
+  `projecao_pendente` **na mesma transação** (nenhuma alteração escapa); o projetor copia o *estado atual* (não aplica
+  deltas), então reprocessar é idempotente e a ordem não importa, e um `WHERE atualizado_em <=` impede que uma cópia
+  velha sobrescreva uma nova. A consistência é eventual (milissegundos): logo depois do `202`, o `GET` pode dar 404
+  por um instante. `/health` mostra `modeloLeitura.pendentes`. Código: `startProjetor` em `services/reservas/src/index.ts`.
+- **Autoescala do consumidor pela fila**: `services/autoscaler` lê `ApproximateNumberOfMessages(+NotVisible)` da
+  `pagamentos-queue` a cada 5 s e ajusta as réplicas de `pagamentos` para `ceil(profundidade / 5)`, entre 2 e 6
+  (`AUTOSCALE_MIN`, `AUTOSCALE_MAX`, `AUTOSCALE_MSGS_POR_REPLICA`). Sobe na hora; desce uma réplica por vez após 30 s
+  de fila baixa (evita oscilação). Escala via `docker compose up --scale` pelo socket do Docker; na AWS o equivalente
+  seria Application Auto Scaling do ECS com alarme do CloudWatch na mesma métrica. Reduzir é seguro: o `pagamentos`
+  trata `SIGTERM` (termina a mensagem atual, devolve à fila as que não começou) e tudo é idempotente.
+  Fica num *profile* para não interferir no F8 manual:
+  `docker compose --profile autoscale up -d autoscaler` ou `./scripts/bonus-autoescala.sh`
+  (40 reservas com gateway lento: 2 → 6 réplicas, todas confirmadas, sem pagamento duplicado, e volta gradual a 2).
 
 ## Estrutura
 
@@ -136,10 +169,10 @@ As filas SQS são *standard*: não há garantia de ordem e pode haver duplicata.
 contracts/            envelope + JSON Schemas por evento/versão + AsyncAPI + exemplos
 docs/arquitetura.svg  diagrama (PNG também)
 infra/                init-ministack.sh (usado pelo compose) e terraform/
-scripts/              demo-fluxo-feliz.sh e f1..f8
+scripts/              demo-fluxo-feliz.sh, f1..f8 e bonus-autoescala.sh
 services/reservas     TypeScript   services/notificacoes  TypeScript
 services/frota        Java/Spring  services/pagamentos    Python
-services/gateway-pagamento  Python
+services/gateway-pagamento  Python   services/autoscaler  Python (bônus)
 ```
 
 ## Variáveis úteis
@@ -153,3 +186,7 @@ services/gateway-pagamento  Python
 | `RESERVA_TIMEOUT_SEGUNDOS` | 30 | Valor inicial do parâmetro SSM de timeout da saga |
 | `MAX_RECEIVE_COUNT` | 3 | Tentativas antes da DLQ |
 | `RESERVA_CONFIRMADA_VERSAO` | 2 | Versão de `ReservaConfirmada` publicada |
+| `OTEL_SDK_DISABLED` | false | `true` desliga o tracing |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4318` | Coletor OTLP (Jaeger local ou outro) |
+| `AUTOSCALE_MIN` / `AUTOSCALE_MAX` | 2 / 6 | Limites do autoscaler |
+| `AUTOSCALE_MSGS_POR_REPLICA` / `AUTOSCALE_ESFRIAMENTO` | 5 / 30 | Mensagens por réplica / segundos antes de reduzir |

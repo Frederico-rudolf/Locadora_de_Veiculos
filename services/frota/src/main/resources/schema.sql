@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS outbox (
   publicado_em timestamptz,
   tentativas   int NOT NULL DEFAULT 0
 );
+ALTER TABLE outbox ADD COLUMN IF NOT EXISTS traceparent text;  -- contexto do trace (OpenTelemetry)
 CREATE INDEX IF NOT EXISTS outbox_pendentes ON outbox (id) WHERE publicado_em IS NULL;
 
 -- Frota inicial (o cenário F5 usa BNU/SUV = 10 unidades)
